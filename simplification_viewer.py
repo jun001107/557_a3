@@ -1,0 +1,527 @@
+import trimesh
+import numpy as np
+from pathlib import Path
+import moderngl as mgl
+from sortedcontainers import SortedList
+from pyglm import glm
+from PyQt5 import QtOpenGL
+from heds import HalfEdge, Vertex, EdgeCollapseData, build_heds, CollapseRecord
+from moderngl_text.text_renderer import TextRenderer
+
+
+class SimplificationViewer(QtOpenGL.QGLWidget):
+    """ OpenGL widget with simple viewing controls """
+
+    def __init__(self):
+        fmt = QtOpenGL.QGLFormat()
+        fmt.setVersion(3, 3)
+        fmt.setProfile(QtOpenGL.QGLFormat.CoreProfile)
+        fmt.setSampleBuffers(True)
+        super(SimplificationViewer, self).__init__(fmt, None)
+        self.update_UI_callback = None  # notify UI of changes (e.g., LOD slider)
+        self.keyboard_callback = None  # make keyboard usable
+        self.draw_quadrics = False
+        self.draw_face_IDs = False
+        self.draw_vertex_IDs = False
+        self.draw_current_he = True
+        self.scale_with_LOD = False        
+        self.mesh_wireframe = False
+        self.current_LOD = 0
+        self.max_LOD = 0  # the number of simplification levels available
+        self.collapse_history = []  # keep track of collapse records for undoing
+        self.last_mouse_pos = None
+        self.R = glm.mat4(1)  # current rotation matrix for view
+        self.d = 4.0  # current distance of the camera
+
+        self.vao, self.vbo, self.ibo = None, None, None  # Will be created when mesh is loaded
+        self.text_renderer = None # used for rendering text labels on verts and faces
+        self.ctx = None
+        self.prog_tris = None  # Mesh shader
+        self.prog_lines = None  # Line shader
+        self.width, self.height = None, None
+        self.P, self.V, self.S = None, None, None  # Projection, View, Scale matrices
+
+        # For visualizing half edges
+        self.he_geom, self.he_vbo, self.he_vao, self.current_he = None, None, None, None
+        # General data
+        self.indices, self.faces, self.verts = None, None, None
+        self.vert_objs, self.face_objs = None, None
+        self.sorted_edge_list = SortedList()
+
+    def set_update_UI_callback(self, callback):
+        self.update_UI_callback = callback
+
+    def set_keyboard_callback(self, callback):
+        self.keyboard_callback = callback
+
+    def keyPressEvent(self, event):
+        if self.keyboard_callback is not None:
+            self.keyboard_callback(event)
+
+    def initializeGL(self):
+        self.ctx = mgl.create_context()
+        self.text_renderer = TextRenderer(self.ctx)
+        current_dir = Path(__file__).parent  # glsl folder in same directory as this code
+        self.setup_mesh_shaders_and_buffers(current_dir)
+        self.setup_half_edge_shaders_and_buffers(current_dir)
+        mesh_file = current_dir / 'data' / 'icosphere.obj'
+        self.load_mesh_from_file(str(mesh_file))
+
+    def resizeGL(self, width, height):
+        self.ctx.viewport = (0, 0, width, height)
+        self.width = width
+        self.height = height
+
+    def paintGL(self):
+        self.update_matrices()
+        self.ctx.clear(0, 0, 0, 1)  # clear the whole drawing surface
+        self.ctx.enable(mgl.DEPTH_TEST)  # always use depth test!
+        self.ctx.enable(mgl.BLEND)
+        # draw the mesh at the current LOD
+        # no culling for triangles (helps to see backside if using boundaries (or for bugs))
+        self.ctx.disable(mgl.CULL_FACE)
+        if self.mesh_wireframe:
+            self.ctx.wireframe = self.mesh_wireframe
+            self.prog_tris['u_use_lighting'].value = False
+        self.prog_tris['u_color'].value = (0.8, 0.7, 0.6, 1 - 0.5 * self.mesh_wireframe)  # set the color uniform
+        if len(self.face_objs) == 0:
+            self.vao.render()  # HEDS not built yet, just draw everything!
+        else:
+            self.vao.render( vertices = 3 * (len(self.face_objs) - 2*self.current_LOD) )# skip two faces for each LOD    
+        self.ctx.wireframe = False
+        self.prog_tris['u_use_lighting'].value = True
+        # as selected in the UI, draw half edge, vertex IDs, face IDs
+        if self.draw_current_he and self.current_LOD == self.max_LOD:
+            self.ctx.enable(mgl.CULL_FACE)  # ray traced cylinders need backface culling
+            self.ctx.cull_face = 'back'
+            self.he_vao.render()  # draw the half-edge
+            self.ctx.disable(mgl.CULL_FACE)  # ray traced cylinders need backface culling
+        if self.draw_vertex_IDs:
+            # New verts always added to end, so go to end of list if at highest LOD, otherwise stop before new verts
+            k = self.max_LOD - self.current_LOD
+            for v in self.vert_objs if k == 0 else self.vert_objs[:-k]:
+                if v.removed_at_level is not None and v.removed_at_level < self.current_LOD:
+                    continue
+                v.draw_debug(self.P, self.V, self.text_renderer)
+        if self.draw_face_IDs:
+            for i in range( len(self.face_objs) - 2*self.current_LOD ):
+                self.face_objs[i].draw_debug(self.P, self.V, self.faces, self.vert_objs, self.text_renderer)
+
+    def get_vertex_count(self):
+        count = 0
+        k = self.max_LOD - self.current_LOD
+        for v in self.vert_objs if k == 0 else self.vert_objs[:-k]:
+            if v.removed_at_level is not None and v.removed_at_level < self.current_LOD:
+                continue
+            count += 1
+        return count
+
+    def get_face_count(self):
+        return len(self.face_objs) - 2 * self.current_LOD
+
+    def setup_mesh_shaders_and_buffers(self, current_dir):
+        self.prog_tris = self.ctx.program(
+            vertex_shader=open(current_dir / 'glsl' / 'tris-vert.glsl').read(),
+            geometry_shader=open(current_dir / 'glsl' / 'tris-geom.glsl').read(),
+            fragment_shader=open(current_dir / 'glsl' / 'tris-frag.glsl').read())
+        self.prog_tris['u_color'].value = (0.8, 0.7, 0.6, 1.0)  # set the color uniform
+        self.prog_tris['u_use_lighting'].value = True
+        self.prog_tris['u_light_pos'].value = (15, 15, 15)  # light position in view coordinates
+
+    def setup_half_edge_shaders_and_buffers(self, current_dir):
+        self.prog_lines = self.ctx.program(
+            vertex_shader=open(current_dir / 'glsl' / 'fancyline-vert.glsl').read(),
+            geometry_shader=open(current_dir / 'glsl' / 'fancyline-geom.glsl').read(),
+            fragment_shader=open(current_dir / 'glsl' / 'fancyline-frag.glsl').read())
+        self.prog_lines['u_color'].value = (1.0, 0.0, 0.0, 1.0)
+        self.prog_lines['u_light_pos'].value = (15, 15, 15)  # light position in view coordinates
+        self.prog_lines['u_radius'].value = 0.02  # radius of the line in world coordinates
+
+        # set up a half edge... and perhaps a geometry shader for it to draw lines as cylinders?
+        self.he_geom = np.zeros((3, 3), dtype='f4')  # 3 vertices to form a half edge
+        self.he_vbo = self.ctx.buffer(self.he_geom.tobytes())
+        self.he_vao = self.ctx.vertex_array(self.prog_lines, [(self.he_vbo, '3f', 'in_position')], mode=mgl.LINE_STRIP)
+
+    def load_mesh_from_file(self, filename: str):
+        mesh = trimesh.load_mesh(filename)
+        self.faces = mesh.faces  # this is easy because we have only triangles!
+        self.indices = mesh.faces.flatten()
+        self.verts = mesh.vertices  # shape is (num_verts, 3)
+        # center and scale the mesh to fit in a -1 to 1 cube
+        centroid = np.mean(self.verts, axis=0)
+        self.verts -= centroid
+        scale = np.max(np.linalg.norm(self.verts, axis=1))
+        if scale > 1e-6:
+            self.verts /= scale
+        # Make vertex objects, initially without half edges,
+        # 	and only for the current vertices (this list will grow as we collapse edges)
+        self.vert_objs = [Vertex(i, pos, None) for i, pos in enumerate(self.verts)]
+        # build the half edge data structure
+        half_edges, self.face_objs = build_heds(self.faces, self.vert_objs)
+
+        # NOTE: reserve an appropriate amount of space in the vertex buffer
+        # Every collapse removes one vertex, 2 faces, and 3 edges.
+        # won't go past a tetrahedron, so expect half of num faces - 4 
+        num_collapses_expected = (self.faces.shape[0] - 4) // 2  # each collapse removes 2 faces
+        self.verts = np.vstack((self.verts, np.zeros((num_collapses_expected, 3), dtype='f4')))
+
+        self.vbo = self.ctx.buffer(self.verts.astype('f4').tobytes())
+        self.ibo = self.ctx.buffer(self.faces.flatten().astype('i4').tobytes())
+        self.vao = self.ctx.vertex_array(self.prog_tris, [(self.vbo, '3f', 'in_position')], self.ibo, mode=mgl.TRIANGLES)
+
+        # once the heds is initialized, compute the quadrics for each vertex, and the edge collapse costs
+        if half_edges:
+            for v in self.vert_objs:
+                v.compute_Q()
+                v.compute_debug_viz_data()  # while we're at it, collect some debug viz data
+
+            self.compute_edge_collapse_costs(half_edges)
+
+            self.current_he = half_edges[0]
+            self.update_half_edge_geometry()
+
+        self.current_LOD = 0
+        self.max_LOD = 0  # the number of simplification levels available
+        self.collapse_history = []  # keep track of collapse records for undoing
+        self.update_UI_callback()  # updates the LOD slider
+
+    def update_half_edge_geometry(self):
+        v0 = self.current_he.next.next.head.pos
+        v1 = self.current_he.head.pos
+        v2 = self.current_he.next.head.pos
+        center = self.current_he.face.get_center()
+        normal = self.current_he.face.get_normal() * glm.length(center - v0) * 0.1
+        self.he_geom[0] = normal + 0.9 * v0 + 0.1 * center
+        self.he_geom[1] = normal + 0.9 * v1 + 0.1 * center
+        self.he_geom[2] = normal + 0.9 * (0.8 * v1 + 0.2 * v2) + 0.1 * center
+        self.he_vbo.write(self.he_geom.tobytes())
+
+    def update_matrices(self):
+        self.P = glm.perspective(glm.radians(45.0), self.width / self.height, 0.1, 100.0)
+        self.S = glm.mat4(1)
+        if self.scale_with_LOD:
+            max_lod = len(self.face_objs) // 2
+            min_scale = 0.01  # 1% at maximum LOD
+            # Solve: min_scale = base^max_lod  =>  base = min_scale^(1/max_lod)
+            base = min_scale ** (1.0 / max_lod)
+            scale_factor = base ** self.current_LOD
+            self.S = glm.scale(glm.mat4(1), glm.vec3(scale_factor, scale_factor, scale_factor))
+        self.V = glm.lookAt(glm.vec3(0, 0, self.d), glm.vec3(0, 0, 0), glm.vec3(0, 1, 0)) * self.R * self.S        
+        self.prog_tris['u_mv'].write(self.V)
+        self.prog_tris['u_mvp'].write(self.P * self.V)
+        self.prog_lines['u_view'].write(self.V)
+        self.prog_lines['u_proj'].write(self.P)
+
+    def mousePressEvent(self, event):
+        self.last_mouse_pos = (event.x(), event.y())
+
+    def mouseMoveEvent(self, event):
+        new_x, new_y = event.x(), event.y()
+        rx = glm.rotate(glm.mat4(1), (new_y - self.last_mouse_pos[1]) * 0.002, glm.vec3(1, 0, 0))
+        ry = glm.rotate(glm.mat4(1), (new_x - self.last_mouse_pos[0]) * 0.002, glm.vec3(0, 1, 0))
+        self.R = ry * rx * self.R
+        self.last_mouse_pos = (new_x, new_y)
+
+    def wheelEvent(self, event):
+        self.d *= np.power(1.1, event.angleDelta().y() / 120)
+
+    def next_half_edge(self):
+        if self.current_he.twin is None:
+            return
+        self.current_he = self.current_he.next
+        self.update_half_edge_geometry()
+
+    def twin_half_edge(self):
+        if self.current_he.twin is None:
+            return
+        self.current_he = self.current_he.twin
+        self.update_half_edge_geometry()
+
+    def collapse_current_half_edge(self):
+        if len(self.sorted_edge_list) <= 6:  # stop when we reach a tetrahedron
+            print("No more edges to collapse")
+            return
+        # discard current half edge form queue if it is there (note that this is different from remove)
+        self.sorted_edge_list.discard(self.current_he.edge_collapse_data)
+        vtail = self.current_he.tail()
+        vhead = self.current_he.head
+        vstar = (vtail.pos + vhead.pos) / 2
+        self.current_he = self.collapse(self.current_he, vstar)
+        self.update_half_edge_geometry()
+
+    def jump_to_best_edge(self):
+        if len(self.sorted_edge_list) <= 6:  # stop when we reach a tetrahedron
+            print("No more edges to collapse")
+            return
+        edge = self.sorted_edge_list[0]
+        self.current_he = edge.he
+        self.update_half_edge_geometry()
+
+    def collapse_best_edge(self):
+        if len(self.sorted_edge_list) <= 6:  # stop when we reach a tetrahedron
+            print("No more edges to collapse")
+            return
+        edge = self.sorted_edge_list.pop(0)  # get and remove the best edge
+        self.current_he = self.collapse(edge.he, edge.v_opt, edge.cost)
+        self.update_half_edge_geometry()
+
+    def collapse_all_in_order(self):
+        # collapse all the edges in order, best edge each time,
+        # 	until we get to a tetrahedron (or otherwise simplest possible mesh)
+        while not len(self.sorted_edge_list) <= 6:
+            edge = self.sorted_edge_list.pop(0)  # get and remove the best edge
+            self.current_he = self.collapse(edge.he, edge.v_opt, edge.cost)
+        self.update_half_edge_geometry()
+
+    def set_LOD(self, level: int):
+        """ set the current LOD to the given level, updating the mesh faces data accordingly """
+        if level < 0 or level > self.max_LOD:
+            print("Invalid LOD level:", level)
+            return
+        while self.current_LOD < level:
+            self.collapse_history[self.current_LOD].redo(self.faces)
+            self.current_LOD += 1
+        while self.current_LOD > level:
+            self.current_LOD -= 1
+            self.collapse_history[self.current_LOD].undo(self.faces)
+        self.ibo.write(self.faces.flatten().astype('i4').tobytes())
+
+    def compute_edge_collapse_costs(self, half_edges: list[HalfEdge]):
+        """ compute the cost of collapsing each edge, and the optimal position for the collapse
+            Store these in a sorted list for O(log(n)) addition and removal, and O(1) query of best edge.
+            This is ONLY called on the first initialization, when we have a list of all half edges! """
+        self.sorted_edge_list = SortedList()
+        for he in half_edges:
+            if he.edge_collapse_data is not None:
+                continue  # already computed
+            edge = EdgeCollapseData(he)
+            self.sorted_edge_list.add(edge)
+
+    def collapse_will_be_bad(self, he: HalfEdge) -> bool:
+        """ check if collapsing this half-edge will create problems (e.g., more than 2 common verts in the 1-rings) """
+
+        # TODO: Objective 4: Check if collapsing this half-edge will create problems
+
+
+        return False
+
+    def collapse(self, he: HalfEdge, vstar: glm.vec3, cost: float = 0.0) -> HalfEdge:
+        """ collapse the given half-edge.
+            If the collapse will not be bad, collapse the edge by:
+            - Making a new Vertex and add to the end of the buffer (and updating the vbo accordingly)
+            - Moving the collapsed faces to the end of the face_obj list (and updating the faces numpy array accordingly)
+            - updating the half edge data structure TODO
+            - updating the computed edge collapse costs for affected half-edges TODO
+            - updating the collapse records  TODO
+
+            Args:
+                he: the hald-edge to collapse
+                vstar: the position of the new vertex
+                cost: cost of the new vertex
+            Returns:
+                 One of the half-edges with the new vertex as head.
+        """
+
+        # ensure we are at the coarest LOD
+        self.set_LOD(self.max_LOD)
+
+        if self.collapse_will_be_bad(he):
+            print("Bad collapse detected, skipping")
+            return he
+
+        # flag old verts as removed at this LOD level (for debug viz)
+        he.head.removed_at_level = self.max_LOD
+        he.tail().removed_at_level = self.max_LOD
+
+        # Create the new vertex at END OF THE LIST.
+        # Set index to be next in the list, and give a half edge that will exist after the collapse
+        new_vertex = Vertex(len(self.vert_objs), vstar, he.next.twin)
+        new_vertex.cost = cost
+        self.vert_objs.append(new_vertex)
+        new_vertex.Q = he.head.Q + he.tail().Q
+        # put it into the verts array, and into the vertex buffer object
+        self.verts[new_vertex.index] = np.array((vstar.x, vstar.y, vstar.z), dtype='f4')
+        self.vbo.write(vstar.to_bytes(), offset=3 * new_vertex.index * 4)
+
+
+        # TODO: Objective 2: Collapse the given half-edge.  See notes from class!
+        # NOTE: removed faces must be swapped with those at the end of face_objs list!
+        # see also that you migth want to complete objective 3 to see the results as
+        # the index buffer needs to be updated to correctly draw the mesh after the 
+        # collapse, and that is done in objective 3 below.
+
+        twin = he.twin
+        if twin is None:
+            print("Cannot collapse boundary edge without twin")
+            return he
+
+        faces_to_remove = [he.face, twin.face]
+        faces_to_remove_set = set(faces_to_remove)
+
+        v_tail = he.tail()
+        v_head = he.head
+
+        def collect_half_edges(vertex: Vertex) -> list[HalfEdge]:
+            """Gather half-edges with the given head vertex, skipping faces slated for removal."""
+            start = vertex.he
+            if start is None:
+                if vertex is v_head:
+                    start = he
+                elif vertex is v_tail:
+                    start = twin
+            if start is None:
+                return []
+            collected = []
+            visited = set()
+            stack = [start]
+            while stack:
+                h = stack.pop()
+                if h is None or h in visited:
+                    continue
+                visited.add(h)
+                if h.head == vertex:
+                    if h.face not in faces_to_remove_set:
+                        collected.append(h)
+                    if h.next is not None and h.next.twin is not None:
+                        stack.append(h.next.twin)
+                    if h.twin is not None and h.twin.next is not None:
+                        stack.append(h.twin.next.next)
+                else:
+                    if h.twin is not None:
+                        stack.append(h.twin)
+                    if h.next is not None and h.next.twin is not None:
+                        stack.append(h.next.twin)
+            return collected
+
+        incident_head = collect_half_edges(v_head)
+        incident_tail = collect_half_edges(v_tail)
+        affected_half_edges = list(dict.fromkeys(incident_head + incident_tail))
+
+        old_head_idx = v_head.index
+        old_tail_idx = v_tail.index
+        new_idx = new_vertex.index
+        affected_face_indices = {h.face.index for h in affected_half_edges}
+        for face_idx in affected_face_indices:
+            face_obj = self.face_objs[face_idx]
+            face_obj.normal = None
+            face_obj.center = None
+            face_obj.M = None
+            face_row = self.faces[face_idx]
+            face_row[face_row == old_head_idx] = new_idx
+            face_row[face_row == old_tail_idx] = new_idx
+
+        v_head.he = None
+        v_tail.he = None
+        for h in affected_half_edges:
+            previous_vertex = h.head
+            h.head = new_vertex
+            if new_vertex.he is None:
+                new_vertex.he = h
+            if previous_vertex is v_head and previous_vertex.he is h:
+                previous_vertex.he = None
+            if previous_vertex is v_tail and previous_vertex.he is h:
+                previous_vertex.he = None
+
+        if new_vertex.he is None and affected_half_edges:
+            new_vertex.he = affected_half_edges[0]
+
+        active_end = len(self.face_objs) - 2 * self.max_LOD
+        swap_target = active_end - 1
+
+        def swap_faces(i: int, j: int):
+            if i == j:
+                return
+            self.faces[[i, j]] = self.faces[[j, i]]
+            self.face_objs[i], self.face_objs[j] = self.face_objs[j], self.face_objs[i]
+            self.face_objs[i].index = i
+            self.face_objs[j].index = j
+            self.face_objs[i].normal = None
+            self.face_objs[i].center = None
+            self.face_objs[i].M = None
+            self.face_objs[j].normal = None
+            self.face_objs[j].center = None
+            self.face_objs[j].M = None
+
+        for face in faces_to_remove:
+            idx = face.index
+            if idx < active_end:
+                swap_faces(idx, swap_target)
+                face.index = swap_target
+                swap_target -= 1
+                active_end -= 1
+            else:
+                swap_target -= 1
+                active_end -= 1
+
+        he.edge_collapse_data = None
+        twin.edge_collapse_data = None
+
+        # TODO: Objective 6: Maintain the sorted list of edge collapse costs
+        # After collapsing an edge, the quadric error metrics of the new vertex is set,
+        # so we need to do some careful work to make sure the sorted list is updated to
+        # have updated edge collapse data for the half-edges around the new vertex.
+        # (best to remove all, and then re-add newly computed versions)
+        
+
+
+        # TODO: Objective 3: Undo / Redo by making and collecting collapse records 
+
+        # TODO: You need to fill in the correct data for the CollapseRecord here
+        head_face_counts = {}
+        for h in incident_head:
+            idx = h.face.index
+            head_face_counts[idx] = head_face_counts.get(idx, 0) + 1
+        tail_face_counts = {}
+        for h in incident_tail:
+            idx = h.face.index
+            tail_face_counts[idx] = tail_face_counts.get(idx, 0) + 1
+
+        affected_faces = []
+        old_face_rows = []
+        new_face_rows = []
+        dtype = self.faces.dtype
+
+        for face_idx in sorted(affected_face_indices):
+            face_obj = self.face_objs[face_idx]
+            affected_faces.append(face_obj)
+
+            new_row = self.faces[face_idx].copy()
+            old_row = new_row.copy()
+
+            for _ in range(head_face_counts.get(face_idx, 0)):
+                positions = np.where(old_row == new_idx)[0]
+                if positions.size == 0:
+                    break
+                old_row[positions[0]] = old_head_idx
+
+            for _ in range(tail_face_counts.get(face_idx, 0)):
+                positions = np.where(old_row == new_idx)[0]
+                if positions.size == 0:
+                    break
+                old_row[positions[0]] = old_tail_idx
+
+            old_face_rows.append(old_row)
+            new_face_rows.append(new_row)
+
+        if old_face_rows:
+            old_faces = np.vstack(old_face_rows).astype(dtype, copy=False)
+            new_faces = np.vstack(new_face_rows).astype(dtype, copy=False)
+        else:
+            old_faces = np.zeros((0, 3), dtype=dtype)
+            new_faces = np.zeros((0, 3), dtype=dtype)
+
+        # collapse record tells us how to move to the next LOD, or likewise, how to undo
+        cr = CollapseRecord(affected_faces, old_faces, new_faces)
+        self.collapse_history.append(cr)
+        self.current_LOD += 1
+        self.max_LOD += 1
+
+        cr.redo(self.faces) # THIS APPLIES THE COLLAPSE TO THE FACES numpy array for drawing with opengl
+        self.ibo.write(self.faces.flatten().astype('i4').tobytes()) # update the index buffer object
+
+        # with everything all hooked up, compute the debug viz data for the new vertex
+        new_vertex.compute_debug_viz_data()
+
+        # notify the UI that LOD has changed
+        self.update_UI_callback()
+        return new_vertex.he  # return one of the half-edges with the new vertex as head
