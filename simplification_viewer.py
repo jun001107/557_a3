@@ -351,56 +351,62 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         # collapse, and that is done in objective 3 below.
 
         twin = he.twin
-        if twin is None:
-            print("Cannot collapse boundary edge without twin")
+        face_left = he.face
+        face_right = twin.face if twin is not None else None
+        if face_left is None or twin is None or face_right is None:
+            he.head.removed_at_level = None
+            he.tail().removed_at_level = None
+            if self.vert_objs and self.vert_objs[-1] is new_vertex:
+                self.vert_objs.pop()
+            zero_vec = np.zeros(3, dtype='f4')
+            self.verts[new_vertex.index] = zero_vec
+            self.vbo.write(zero_vec.tobytes(), offset=3 * new_vertex.index * 4)
             return he
 
-        faces_to_remove = [he.face, twin.face]
+        faces_to_remove = (face_left, face_right)
         faces_to_remove_set = set(faces_to_remove)
 
         v_tail = he.tail()
         v_head = he.head
 
-        def collect_half_edges(vertex: Vertex) -> list[HalfEdge]:
-            """Gather half-edges with the given head vertex, skipping faces slated for removal."""
+        def collect_incident(vertex: Vertex) -> list[HalfEdge]:
+            """Collect half-edges incident to vertex, excluding faces marked for removal."""
+            result = []
             start = vertex.he
             if start is None:
-                if vertex is v_head:
-                    start = he
-                elif vertex is v_tail:
-                    start = twin
-            if start is None:
-                return []
-            collected = []
+                return result
+            h = start
             visited = set()
-            stack = [start]
-            while stack:
-                h = stack.pop()
-                if h is None or h in visited:
-                    continue
+            while True:
+                if h in visited:
+                    break
                 visited.add(h)
-                if h.head == vertex:
-                    if h.face not in faces_to_remove_set:
-                        collected.append(h)
-                    if h.next is not None and h.next.twin is not None:
-                        stack.append(h.next.twin)
-                    if h.twin is not None and h.twin.next is not None:
-                        stack.append(h.twin.next.next)
-                else:
-                    if h.twin is not None:
-                        stack.append(h.twin)
-                    if h.next is not None and h.next.twin is not None:
-                        stack.append(h.next.twin)
-            return collected
+                if h.face not in faces_to_remove_set:
+                    result.append(h)
+                h = h.next.twin
+                if h is None or h == start:
+                    break
+            return result
 
-        incident_head = collect_half_edges(v_head)
-        incident_tail = collect_half_edges(v_tail)
-        affected_half_edges = list(dict.fromkeys(incident_head + incident_tail))
+        incident_head = collect_incident(v_head)
+        incident_tail = collect_incident(v_tail)
+
+        affected_half_edges = []
+        seen_half_edges = set()
+        for h in incident_head + incident_tail:
+            if h not in seen_half_edges:
+                affected_half_edges.append(h)
+                seen_half_edges.add(h)
 
         old_head_idx = v_head.index
         old_tail_idx = v_tail.index
         new_idx = new_vertex.index
-        affected_face_indices = {h.face.index for h in affected_half_edges}
+
+        affected_face_indices = set()
+        for h in affected_half_edges:
+            if h.face is not None and h.face not in faces_to_remove_set:
+                affected_face_indices.add(h.face.index)
+
         for face_idx in affected_face_indices:
             face_obj = self.face_objs[face_idx]
             face_obj.normal = None
@@ -413,17 +419,83 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         v_head.he = None
         v_tail.he = None
         for h in affected_half_edges:
-            previous_vertex = h.head
             h.head = new_vertex
-            if new_vertex.he is None:
-                new_vertex.he = h
-            if previous_vertex is v_head and previous_vertex.he is h:
-                previous_vertex.he = None
-            if previous_vertex is v_tail and previous_vertex.he is h:
-                previous_vertex.he = None
+        new_vertex.he = affected_half_edges[0] if affected_half_edges else None
 
-        if new_vertex.he is None and affected_half_edges:
-            new_vertex.he = affected_half_edges[0]
+        edges_to_pair = []
+        for face_idx in affected_face_indices:
+            face_obj = self.face_objs[face_idx]
+            he_face = face_obj.he
+            if he_face is None:
+                continue
+            h = he_face
+            for _ in range(3):
+                if h.face not in faces_to_remove_set:
+                    tail_vertex = h.tail()
+                    if tail_vertex is not None and (tail_vertex is new_vertex or h.head is new_vertex):
+                        edges_to_pair.append(h)
+                h = h.next
+
+        for h in edges_to_pair:
+            h.twin = None
+
+        edge_map: dict[tuple[int, int], HalfEdge] = {}
+        for h in edges_to_pair:
+            tail_vertex = h.tail()
+            if tail_vertex is None:
+                continue
+            key = (tail_vertex.index, h.head.index)
+            edge_map[key] = h
+
+        for key, h in edge_map.items():
+            reverse_key = (key[1], key[0])
+            twin_edge = edge_map.get(reverse_key)
+            if twin_edge is not None:
+                h.twin = twin_edge
+                twin_edge.twin = h
+
+        vertices_to_fix = {new_vertex}
+        for face_idx in affected_face_indices:
+            face_obj = self.face_objs[face_idx]
+            he_face = face_obj.he
+            if he_face is None:
+                continue
+            h = he_face
+            for _ in range(3):
+                if h.face not in faces_to_remove_set:
+                    vertices_to_fix.add(h.head)
+                h = h.next
+
+        for vertex in vertices_to_fix:
+            if vertex is new_vertex:
+                continue
+            if vertex.he is not None and vertex.he.face not in faces_to_remove_set and vertex.he.face is not None:
+                continue
+            replacement = None
+            for face_idx in affected_face_indices:
+                face_obj = self.face_objs[face_idx]
+                he_face = face_obj.he
+                if he_face is None:
+                    continue
+                h = he_face
+                for _ in range(3):
+                    if h.face not in faces_to_remove_set and h.head is vertex:
+                        replacement = h
+                        break
+                    h = h.next
+                if replacement is not None:
+                    break
+            if replacement is not None:
+                vertex.he = replacement
+
+        removed_half_edges = [he, he.next, he.next.next, twin, twin.next, twin.next.next]
+        for removed in removed_half_edges:
+            if removed is None:
+                continue
+            removed.twin = None
+            removed.face = None
+            removed.next = None
+            removed.edge_collapse_data = None
 
         active_end = len(self.face_objs) - 2 * self.max_LOD
         swap_target = active_end - 1
@@ -446,12 +518,27 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
             idx = face.index
             if idx < active_end:
                 swap_faces(idx, swap_target)
-                face.index = swap_target
-                swap_target -= 1
-                active_end -= 1
-            else:
-                swap_target -= 1
-                active_end -= 1
+            face.index = swap_target
+            face.he = None
+            swap_target -= 1
+            active_end -= 1
+
+        drawable_limit = len(self.face_objs) - 2 * self.max_LOD
+        assert {face.index for face in faces_to_remove} == {drawable_limit - 1, drawable_limit - 2}
+
+        assert new_vertex.he is not None and new_vertex.he.head is new_vertex
+        sanity_edge = new_vertex.he
+        visited_edges = set()
+        steps = 0
+        while sanity_edge is not None and sanity_edge not in visited_edges and steps < 128:
+            visited_edges.add(sanity_edge)
+            assert sanity_edge.face is not None
+            assert sanity_edge.next is not None
+            assert sanity_edge.twin is not None
+            assert sanity_edge.twin.twin is sanity_edge
+            sanity_edge = sanity_edge.next.twin
+            steps += 1
+        assert sanity_edge == new_vertex.he
 
         he.edge_collapse_data = None
         twin.edge_collapse_data = None
