@@ -407,6 +407,10 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
             if h.face is not None and h.face not in faces_to_remove_set:
                 affected_face_indices.add(h.face.index)
 
+        faces_for_record = [self.face_objs[idx] for idx in sorted(affected_face_indices)]
+        faces_for_record.extend(faces_to_remove)
+        old_face_row_map = {face: self.faces[face.index].copy() for face in faces_for_record}
+
         for face_idx in affected_face_indices:
             face_obj = self.face_objs[face_idx]
             face_obj.normal = None
@@ -522,6 +526,7 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
             face.he = None
             swap_target -= 1
             active_end -= 1
+        new_face_rows = [self.faces[face.index].copy() for face in faces_for_record]
 
         drawable_limit = len(self.face_objs) - 2 * self.max_LOD
         assert {face.index for face in faces_to_remove} == {drawable_limit - 1, drawable_limit - 2}
@@ -554,44 +559,11 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         # TODO: Objective 3: Undo / Redo by making and collecting collapse records 
 
         # TODO: You need to fill in the correct data for the CollapseRecord here
-        head_face_counts = {}
-        for h in incident_head:
-            idx = h.face.index
-            head_face_counts[idx] = head_face_counts.get(idx, 0) + 1
-        tail_face_counts = {}
-        for h in incident_tail:
-            idx = h.face.index
-            tail_face_counts[idx] = tail_face_counts.get(idx, 0) + 1
-
-        affected_faces = []
-        old_face_rows = []
-        new_face_rows = []
+        affected_faces = faces_for_record
         dtype = self.faces.dtype
 
-        for face_idx in sorted(affected_face_indices):
-            face_obj = self.face_objs[face_idx]
-            affected_faces.append(face_obj)
-
-            new_row = self.faces[face_idx].copy()
-            old_row = new_row.copy()
-
-            for _ in range(head_face_counts.get(face_idx, 0)):
-                positions = np.where(old_row == new_idx)[0]
-                if positions.size == 0:
-                    break
-                old_row[positions[0]] = old_head_idx
-
-            for _ in range(tail_face_counts.get(face_idx, 0)):
-                positions = np.where(old_row == new_idx)[0]
-                if positions.size == 0:
-                    break
-                old_row[positions[0]] = old_tail_idx
-
-            old_face_rows.append(old_row)
-            new_face_rows.append(new_row)
-
-        if old_face_rows:
-            old_faces = np.vstack(old_face_rows).astype(dtype, copy=False)
+        if affected_faces:
+            old_faces = np.vstack([old_face_row_map[face] for face in affected_faces]).astype(dtype, copy=False)
             new_faces = np.vstack(new_face_rows).astype(dtype, copy=False)
         else:
             old_faces = np.zeros((0, 3), dtype=dtype)
