@@ -8,7 +8,7 @@ class MeshSimplificationApp(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mesh Simplification - COMP557F25A3 - YOUR NAME - YOUR ID")
+        self.setWindowTitle("Mesh Simplification - COMP557F25A3 - Junghoon Cho - 260854962")
 
         main_layout = QHBoxLayout()
 
