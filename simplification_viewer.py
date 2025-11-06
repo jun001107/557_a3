@@ -302,6 +302,67 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
 
         # TODO: Objective 4: Check if collapsing this half-edge will create problems
 
+        if he is None or he.twin is None or he.face is None or he.twin.face is None:
+            return True
+
+        v_head = he.head
+        v_tail = he.tail()
+        if v_head is None or v_tail is None or v_head is v_tail:
+            return True
+
+        he_next = he.next
+        twin_next = he.twin.next
+        if he_next is None or he_next.head is None or twin_next is None or twin_next.head is None:
+            return True
+        opp1 = he_next.head
+        opp2 = twin_next.head
+        if opp1 is None or opp2 is None or opp1 is opp2:
+            return True
+
+        def collect_neighbors(vertex: Vertex, other: Vertex) -> tuple[set, bool]:
+            neighbors = set()
+            start = vertex.he
+            if start is None:
+                return neighbors, True
+            h = start
+            visited = set()
+            while True:
+                if h is None:
+                    return neighbors, True
+                if h.head is None or h.head is not vertex:
+                    return neighbors, True
+                tail_vertex = h.tail()
+                if tail_vertex is None:
+                    return neighbors, True
+                if tail_vertex not in (vertex, other):
+                    neighbors.add(tail_vertex)
+                visited.add(h)
+                next_he = h.next
+                if next_he is None:
+                    return neighbors, True
+                twin_he = next_he.twin
+                if twin_he is None:
+                    return neighbors, True
+                h = twin_he
+                if h == start:
+                    break
+                if h in visited:
+                    return neighbors, True
+            return neighbors, False
+
+        neighbors_head, bad_head = collect_neighbors(v_head, v_tail)
+        if bad_head:
+            return True
+        neighbors_tail, bad_tail = collect_neighbors(v_tail, v_head)
+        if bad_tail:
+            return True
+
+        neighbors_head.discard(v_tail)
+        neighbors_tail.discard(v_head)
+
+        shared = neighbors_head.intersection(neighbors_tail)
+        if len(shared) != 2 or opp1 not in shared or opp2 not in shared:
+            return True
 
         return False
 
