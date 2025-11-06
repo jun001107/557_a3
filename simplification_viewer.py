@@ -385,7 +385,7 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
 
         # ensure we are at the coarest LOD
         self.set_LOD(self.max_LOD)
-
+        
         if self.collapse_will_be_bad(he):
             print("Bad collapse detected, skipping")
             return he
@@ -614,7 +614,73 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         # so we need to do some careful work to make sure the sorted list is updated to
         # have updated edge collapse data for the half-edges around the new vertex.
         # (best to remove all, and then re-add newly computed versions)
-        
+        old_vertices = [v_head, v_tail]
+
+        stale_edges = []
+        for edge_data in list(self.sorted_edge_list):
+            he_edge = edge_data.he
+            stale = False
+            if he_edge is None:
+                stale = True
+            else:
+                twin_edge = he_edge.twin
+                if twin_edge is None:
+                    stale = True
+                else:
+                    if he_edge.face is None or twin_edge.face is None:
+                        stale = True
+                    elif he_edge.next is None or he_edge.next.next is None:
+                        stale = True
+                    elif twin_edge.next is None or twin_edge.next.next is None:
+                        stale = True
+                if not stale:
+                    head = he_edge.head
+                    tail = twin_edge.head if twin_edge is not None else None
+                    if head is None or tail is None:
+                        stale = True
+                    else:
+                        if head in old_vertices or tail in old_vertices or head is new_vertex or tail is new_vertex:
+                            stale = True
+            if stale:
+                stale_edges.append(edge_data)
+
+        for edge_data in stale_edges:
+            self.sorted_edge_list.discard(edge_data)
+            he_edge = edge_data.he
+            if he_edge is not None and he_edge.edge_collapse_data is edge_data:
+                he_edge.edge_collapse_data = None
+            if he_edge is not None and he_edge.twin is not None and he_edge.twin.edge_collapse_data is edge_data:
+                he_edge.twin.edge_collapse_data = None
+
+        new_edges = []
+        unique_pairs = set()
+        start = new_vertex.he
+        if start is not None:
+            h = start
+            visited = set()
+            while h is not None and h not in visited:
+                visited.add(h)
+                twin = h.twin
+                if (
+                    h.face is not None and twin is not None and twin.face is not None
+                    and h.next is not None and h.next.next is not None
+                    and twin.next is not None and twin.next.next is not None
+                    and h.head is not None and twin.head is not None
+                ):
+                    pair = tuple(sorted((h.head.index, twin.head.index)))
+                    if pair not in unique_pairs:
+                        unique_pairs.add(pair)
+                        new_edges.append(h)
+                next_he = h.next
+                if next_he is None or next_he.twin is None:
+                    break
+                h = next_he.twin
+                if h == start:
+                    break
+
+        for h in new_edges:
+            edge_data = EdgeCollapseData(h)
+            self.sorted_edge_list.add(edge_data)
 
 
         # TODO: Objective 3: Undo / Redo by making and collecting collapse records 

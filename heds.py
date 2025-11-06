@@ -118,6 +118,30 @@ class Vertex:
         self.Q = glm.mat4(0)
 
         # TODO: Objective 5: Compute the quadric matrix Q for this vertex
+        start = self.he
+        if start is None:
+            return
+
+        h = start
+        visited = set()
+        while True:
+            if h is None or h in visited:
+                break
+            visited.add(h)
+            face = h.face
+            if face is not None and face.he is not None:
+                normal = face.get_normal()
+                if glm.length(normal) > 1e-12:
+                    # Plane equation: n.x * X + n.y * Y + n.z * Z + d = 0
+                    d = -glm.dot(normal, self.pos)
+                    plane = glm.vec4(normal.x, normal.y, normal.z, d)
+                    self.Q += glm.outerProduct(plane, plane)
+            next_he = h.next
+            if next_he is None:
+                break
+            h = next_he.twin
+            if h is None or h == start:
+                break
 
 
     def get_normal(self) -> glm.vec3:
@@ -181,10 +205,50 @@ class EdgeCollapseData:
         self.he.twin.edge_collapse_data = self
 
         # TODO: Objective 5: Compute cost, optimal position, and quadric matrix for edge collapse
-        # TODO: change the following dummy values!
-        self.cost = 1
-        self.Q = glm.mat4(1)
-        self.v_opt = glm.vec3(0)
+        v_tail = he.tail()
+        v_head = he.head
+        if v_tail is None or v_head is None:
+            self.cost = float('inf')
+            self.Q = glm.mat4(0)
+            self.v_opt = glm.vec3(0)
+            return
+
+        self.Q = v_tail.Q + v_head.Q
+
+        # Extract A (3x3) and b (3x1) from the quadric matrix
+        A = np.array([[float(self.Q[c][r]) for c in range(3)] for r in range(3)], dtype=float)
+        b = np.array([float(self.Q[3][r]) for r in range(3)], dtype=float)
+
+        candidates = []
+        detA = np.linalg.det(A)
+        if abs(detA) > 1e-10:
+            try:
+                v_opt_np = -np.linalg.solve(A, b)
+                if np.all(np.isfinite(v_opt_np)):
+                    v_opt = glm.vec3(float(v_opt_np[0]), float(v_opt_np[1]), float(v_opt_np[2]))
+                    candidates.append(v_opt)
+            except np.linalg.LinAlgError:
+                pass
+
+        tail_pos = v_tail.pos
+        head_pos = v_head.pos
+        mid_pos = (tail_pos + head_pos) * 0.5
+        candidates.extend([tail_pos, head_pos, mid_pos])
+
+        def quadric_cost(pos: glm.vec3) -> float:
+            vec = glm.vec4(pos.x, pos.y, pos.z, 1.0)
+            return float(glm.dot(vec, self.Q * vec))
+
+        best_cost = float('inf')
+        best_pos = glm.vec3(0)
+        for candidate in candidates:
+            cost = quadric_cost(candidate)
+            if np.isfinite(cost) and cost < best_cost:
+                best_cost = cost
+                best_pos = candidate
+
+        self.v_opt = best_pos
+        self.cost = best_cost
 
     def __lt__(self, other):
         if self.cost == other.cost:
