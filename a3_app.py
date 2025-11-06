@@ -1,3 +1,6 @@
+# Name: Junghoon Cho
+# ID: 260854962
+
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QApplication
 from controls import ControlPanel

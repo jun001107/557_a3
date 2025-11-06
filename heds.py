@@ -1,3 +1,6 @@
+# Name: Junghoon Cho
+# ID: 260854962
+
 import numpy as np
 from pyglm import glm
 
@@ -326,4 +329,3 @@ def build_heds(F: np.ndarray, vert_objs: list[Vertex]) -> (list[HalfEdge], list[
             edge_map[(tail_idx, head_idx)] = he
 
     return he_list, face_objs
-

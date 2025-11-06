@@ -1,3 +1,6 @@
+# Name: Junghoon Cho
+# ID: 260854962
+
 import trimesh
 import numpy as np
 from pathlib import Path
@@ -47,6 +50,8 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         self.indices, self.faces, self.verts = None, None, None
         self.vert_objs, self.face_objs = None, None
         self.sorted_edge_list = SortedList()
+
+        self.count = 0
 
     def set_update_UI_callback(self, callback):
         self.update_UI_callback = callback
@@ -314,6 +319,7 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         twin_next = he.twin.next
         if he_next is None or he_next.head is None or twin_next is None or twin_next.head is None:
             return True
+        
         opp1 = he_next.head
         opp2 = twin_next.head
         if opp1 is None or opp2 is None or opp1 is opp2:
@@ -389,6 +395,10 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         if self.collapse_will_be_bad(he):
             print("Bad collapse detected, skipping")
             return he
+        
+        # self.count += 1
+        # if self.count % 100 == 0:
+        #     print(self.count)
 
         # flag old verts as removed at this LOD level (for debug viz)
         he.head.removed_at_level = self.max_LOD
@@ -595,15 +605,13 @@ class SimplificationViewer(QtOpenGL.QGLWidget):
         assert new_vertex.he is not None and new_vertex.he.head is new_vertex
         sanity_edge = new_vertex.he
         visited_edges = set()
-        steps = 0
-        while sanity_edge is not None and sanity_edge not in visited_edges and steps < 128:
+        while sanity_edge is not None and sanity_edge not in visited_edges:
             visited_edges.add(sanity_edge)
             assert sanity_edge.face is not None
             assert sanity_edge.next is not None
             assert sanity_edge.twin is not None
             assert sanity_edge.twin.twin is sanity_edge
             sanity_edge = sanity_edge.next.twin
-            steps += 1
         assert sanity_edge == new_vertex.he
 
         he.edge_collapse_data = None

@@ -1,3 +1,6 @@
+# Name: Junghoon Cho
+# ID: 260854962
+
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QLabel, QPushButton, QFileDialog
 from PyQt5.QtCore import Qt
